@@ -69,6 +69,7 @@ import org.nuxeo.ecm.core.storage.dbs.DBSExpressionEvaluator;
 import org.nuxeo.ecm.core.storage.dbs.DBSRepositoryBase;
 import org.nuxeo.ecm.core.storage.dbs.DBSStateFlattener;
 import org.nuxeo.ecm.core.storage.dbs.DBSTransactionState.ChangeTokenUpdater;
+import org.nuxeo.ecm.core.storage.marklogic.CursorRegistry.CursorResult;
 import org.nuxeo.ecm.core.storage.marklogic.MarkLogicQueryBuilder.MarkLogicQuery;
 import org.nuxeo.runtime.api.Framework;
 
@@ -79,6 +80,8 @@ import com.marklogic.xcc.ContentFactory;
 import com.marklogic.xcc.ContentSource;
 import com.marklogic.xcc.ContentSourceFactory;
 import com.marklogic.xcc.ModuleInvoke;
+import com.marklogic.xcc.RequestOptions;
+import com.marklogic.xcc.ResultItem;
 import com.marklogic.xcc.ResultSequence;
 import com.marklogic.xcc.SecurityOptions;
 import com.marklogic.xcc.Session;
@@ -95,9 +98,9 @@ public class MarkLogicRepository extends DBSRepositoryBase {
 
     private static final Function<String, String> ID_FORMATTER = id -> String.format("/%s.xml", id);
 
-    public static final String DB_DEFAULT = "nuxeo";
+    private static final CursorRegistry<ResultSequence> CURSOR_REGISTRY = new CursorRegistry<>();
 
-    protected static final String NOSCROLL_ID = "noscroll";
+    public static final String DB_DEFAULT = "nuxeo";
 
     protected ContentSource xccContentSource;
 
@@ -408,31 +411,61 @@ public class MarkLogicRepository extends DBSRepositoryBase {
 
     @Override
     public ScrollResult scroll(DBSExpressionEvaluator evaluator, int batchSize, int keepAliveInSecond) {
-        // Not yet implemented, return all result in one shot for now
+        CURSOR_REGISTRY.checkForTimedOutScroll();
         MarkLogicQueryBuilder builder = new MarkLogicQueryBuilder(evaluator, null, false, rangeElementIndexes);
         String query = builder.buildQuery().getSearchQuery();
-        // Run query
-        try (Session session = xccContentSource.newSession()) {
-            AdhocQuery request = session.newAdhocQuery(query);
+        // Don't auto-close the session as we need to keep it open for next scroll
+        try {
+            Session session = xccContentSource.newSession();
+            // Build option to scroll results and to not retrieve all items to cache them
+            RequestOptions options = new RequestOptions();
+            options.setCacheResult(false);
+            AdhocQuery request = session.newAdhocQuery(query, options);
             // ResultSequence will be closed by Session close
             ResultSequence rs = session.submitRequest(request);
-            return Arrays.stream(rs.asStrings())
-                         .map(MarkLogicStateDeserializer::deserialize)
-                         .map(state -> state.get(KEY_ID).toString())
-                         .collect(Collectors.collectingAndThen(Collectors.toList(),
-                                 ids -> new ScrollResultImpl(NOSCROLL_ID, ids)));
+            String scrollId = CURSOR_REGISTRY.registerCursorResult(
+                    new MarkLogicCursorResult(session, rs, batchSize, keepAliveInSecond));
+            return scroll(scrollId);
         } catch (RequestException e) {
             throw new NuxeoException("An exception happened during xcc call", e);
         }
+        // return Arrays.stream(rs.asStrings())
+        // .map(MarkLogicStateDeserializer::deserialize)
+        // .map(state -> state.get(KEY_ID).toString())
+        // .collect(Collectors.collectingAndThen(Collectors.toList(),
+        // ids -> new ScrollResultImpl(NOSCROLL_ID, ids)));
     }
 
     @Override
     public ScrollResult scroll(String scrollId) {
-        if (NOSCROLL_ID.equals(scrollId)) {
-            // there is only one batch
-            return emptyResult();
+        CursorResult<ResultSequence> cursorResult = CURSOR_REGISTRY.getCursor(scrollId).orElseThrow(
+                () -> new NuxeoException("Unknown or timed out scrollId"));
+        cursorResult.touch();
+        List<String> ids = new ArrayList<>(cursorResult.getBatchSize());
+        synchronized (cursorResult) {
+            ResultSequence cursor = cursorResult.getCursor();
+            if (cursor == null || !cursor.hasNext()) {
+                CURSOR_REGISTRY.unregisterCursor(scrollId);
+                return emptyResult();
+            }
+            while (ids.size() < cursorResult.getBatchSize()) {
+                if (!cursor.hasNext()) {
+                    cursorResult.close();
+                    break;
+                } else {
+                    ResultItem item = cursor.next();
+                    String itemString = item.asString();
+                    State state = MarkLogicStateDeserializer.deserialize(itemString);
+                    String id = state.get(KEY_ID).toString();
+                    if (id != null) {
+                        ids.add(id);
+                    } else {
+                        log.error("Got a document without id: " + itemString);
+                    }
+                }
+            }
         }
-        throw new NuxeoException("Unknown or timed out scrollId");
+        return new ScrollResultImpl(scrollId, ids);
     }
 
     @Override
